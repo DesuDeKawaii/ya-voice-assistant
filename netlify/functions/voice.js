@@ -1,189 +1,118 @@
 // netlify/functions/voice.js
+const fetch = require("node-fetch"); // если нужен, в зависимости от версии Node
+const { Buffer } = require("buffer");
 
-const API_KEY = process.env.YC_API_KEY;
+const API_KEY   = process.env.YC_API_KEY;
 const FOLDER_ID = process.env.YC_FOLDER_ID;
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*", // потом можно ограничить доменом Тильды
+const STT_URL = "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize";
+const GPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion";
+const TTS_URL = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize";
+
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "Content-Type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-async function callSTT(audioBytes) {
-  const url = `https://stt.api.cloud.yandex.net/speech/v1/stt:recognize?folderId=${encodeURIComponent(
-    FOLDER_ID
-  )}&lang=ru-RU&format=oggopus`;
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Api-Key ${API_KEY}`,
-      "Content-Type": "application/octet-stream",
-    },
-    body: audioBytes,
-  });
-
-  const data = await resp.json();
-
-  if (!resp.ok || data.error_code) {
-    throw new Error(
-      `STT error: ${resp.status} ${JSON.stringify(data)}`
-    );
+exports.handler = async (event) => {
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 200, headers: CORS, body: "" };
+  }
+  if (event.httpMethod !== "POST") {
+    return { statusCode: 405, headers: CORS, body: "Method Not Allowed" };
+  }
+  if (!API_KEY || !FOLDER_ID) {
+    return { statusCode: 500, headers: CORS, body: "Missing Yandex config" };
   }
 
-  return data.result; // распознанный текст
-}
+  let body;
+  try {
+    body = JSON.parse(event.body);
+  } catch (e) {
+    return { statusCode: 400, headers: CORS, body: "Bad JSON" };
+  }
+  const { audioBase64 } = body;
+  if (!audioBase64) {
+    return { statusCode: 400, headers: CORS, body: "No audioBase64" };
+  }
 
-async function callGPT(userText) {
-  const url =
-    "https://llm.api.cloud.yandex.net/foundationModels/v1/completion";
+  const audioBuffer = Buffer.from(audioBase64, "base64");
 
-  const body = {
-    modelUri: `gpt://${FOLDER_ID}/yandexgpt/latest`,
-    completionOptions: {
-      stream: false,
-      temperature: 0.3,
-      maxTokens: 400,
-    },
-    messages: [
-      {
-        role: "system",
-        text:
-          "Ты голосовой ассистент сайта по теме ландшафтного дизайна и outdoor-решений. " +
-          "Отвечай кратко, по делу, дружелюбно, ориентируясь на услуги компании.",
-      },
-      {
-        role: "user",
-        text: userText,
-      },
-    ],
-  };
+  // 1) STT
+  const sttResp = await fetch(
+    `${STT_URL}?folderId=${encodeURIComponent(FOLDER_ID)}&lang=ru-RU&format=oggopus`,
+    {
+      method: "POST",
+      headers: { Authorization: `Api-Key ${API_KEY}` },
+      body: audioBuffer,
+    }
+  );
+  const sttJson = await sttResp.json();
+  if (!sttResp.ok || sttJson.error_code) {
+    return {
+      statusCode: 500,
+      headers: CORS,
+      body: JSON.stringify({ ok: false, error: "STT error", detail: sttJson }),
+    };
+  }
+  const user_text = sttJson.result;
 
-  const resp = await fetch(url, {
+  // 2) GPT
+  const gptResp = await fetch(GPT_URL, {
     method: "POST",
     headers: {
       Authorization: `Api-Key ${API_KEY}`,
       "Content-Type": "application/json",
       "x-folder-id": FOLDER_ID,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      modelUri: `gpt://${FOLDER_ID}/yandexgpt/latest`,
+      completionOptions: { stream: false, temperature: 0.3, maxTokens: 400 },
+      messages: [
+        { role: "system", text: "Ты — гид‑ассистент Смоленск-Guide. Отвечай дружелюбно, по существу." },
+        { role: "user", text: user_text },
+      ],
+    }),
   });
-
-  const data = await resp.json();
-
-  if (!resp.ok) {
-    throw new Error(
-      `GPT error: ${resp.status} ${JSON.stringify(data)}`
-    );
+  const gptJson = await gptResp.json();
+  if (!gptResp.ok) {
+    return {
+      statusCode: 500,
+      headers: CORS,
+      body: JSON.stringify({ ok: false, error: "GPT error", detail: gptJson }),
+    };
   }
+  const answer_text = gptJson.result.alternatives[0].message.text.trim();
 
-  return data.result.alternatives[0].message.text.trim();
-}
-
-async function callTTS(answerText) {
-  const url =
-    "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize";
-
-  // параметры идут в теле, как form-данные
-  const params = new URLSearchParams({
-    text: answerText,
+  // 3) TTS
+  const ttsParams = new URLSearchParams({
+    text: answer_text,
     lang: "ru-RU",
     voice: "filipp",
     format: "mp3",
     folderId: FOLDER_ID,
   });
-
-  const resp = await fetch(url, {
+  const ttsResp = await fetch(TTS_URL, {
     method: "POST",
-    headers: {
-      Authorization: `Api-Key ${API_KEY}`,
-    },
-    body: params,
+    headers: { Authorization: `Api-Key ${API_KEY}` },
+    body: ttsParams,
   });
-
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`TTS error: ${resp.status} ${text}`);
+  if (!ttsResp.ok) {
+    const t = await ttsResp.text();
+    return { statusCode: 500, headers: CORS, body: JSON.stringify({ ok: false, error: "TTS error", detail: t }) };
   }
+  const ttsArray = await ttsResp.arrayBuffer();
+  const ttsB64 = Buffer.from(ttsArray).toString("base64");
 
-  const arrayBuffer = await resp.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-  return buffer.toString("base64"); // MP3 в base64
-}
-
-exports.handler = async (event, context) => {
-  if (event.httpMethod === "OPTIONS") {
-    return {
-      statusCode: 200,
-      headers: CORS_HEADERS,
-      body: "",
-    };
-  }
-
-  if (event.httpMethod !== "POST") {
-    return {
-      statusCode: 405,
-      headers: CORS_HEADERS,
-      body: JSON.stringify({ ok: false, error: "Method not allowed" }),
-    };
-  }
-
-  if (!API_KEY || !FOLDER_ID) {
-    return {
-      statusCode: 500,
-      headers: CORS_HEADERS,
-      body: JSON.stringify({
-        ok: false,
-        error: "YC_API_KEY and YC_FOLDER_ID must be set",
-      }),
-    };
-  }
-
-  try {
-    const body = JSON.parse(event.body || "{}");
-    const { audioBase64 } = body;
-
-    if (!audioBase64) {
-      return {
-        statusCode: 400,
-        headers: CORS_HEADERS,
-        body: JSON.stringify({ ok: false, error: "audioBase64 is required" }),
-      };
-    }
-
-    const audioBytes = Buffer.from(audioBase64, "base64");
-
-    // 1. Распознаём речь
-    const userText = await callSTT(audioBytes);
-
-    // 2. Ответ от YandexGPT
-    const answerText = await callGPT(userText);
-
-    // 3. Синтез голоса
-    const answerAudioB64 = await callTTS(answerText);
-
-    return {
-      statusCode: 200,
-      headers: {
-        ...CORS_HEADERS,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        ok: true,
-        user_text: userText,
-        answer_text: answerText,
-        answer_audio_b64: answerAudioB64,
-      }),
-    };
-  } catch (err) {
-    console.error("Voice function error:", err);
-    return {
-      statusCode: 500,
-      headers: CORS_HEADERS,
-      body: JSON.stringify({
-        ok: false,
-        error: String(err),
-      }),
-    };
-  }
+  return {
+    statusCode: 200,
+    headers: { ...CORS, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ok: true,
+      user_text,
+      answer_text,
+      answer_audio_b64: ttsB64,
+    }),
+  };
 };
